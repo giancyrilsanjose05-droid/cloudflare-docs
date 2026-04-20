@@ -29,10 +29,9 @@ The Workflow entrypoint stays static, but the business logic it delegates to is 
 ```txt
 Client
   -> Dispatcher Worker
-  -> Dynamic Worker selected or loaded
   -> Workflow instance created with routing metadata
   -> Static Workflow entrypoint runs
-  -> Dispatcher reloads matching Dynamic Worker
+  -> Create Dynamic Worker
   -> Dynamic Worker handles run(event, step)
   -> Workflows persists step state and output
 ```
