@@ -1,0 +1,235 @@
+---
+title: Dynamic Workers and Workflows
+description: Route Workflow runs into dynamically loaded Worker code while keeping durable Workflow steps and state.
+pcx_content_type: concept
+sidebar:
+  order: 3
+---
+
+import { TypeScriptExample, WranglerConfig } from "~/components";
+
+Use Dynamic Workers with Workflows when one deployed Worker needs to run different Workflow logic per tenant, per request, or per version of code. This pattern keeps Workflow execution durable while loading business logic dynamically at runtime.
+
+## Why use this pattern
+
+Workflows are registered with a static `class_name`, but Dynamic Workers let you choose code at runtime. Combining them gives you durable execution, retries, and step state while still routing each run into different code.
+
+This pattern is useful when you are building:
+
+- Multi-tenant platforms
+- User-defined automation
+- Versioned workflow logic that changes independently of the dispatcher Worker
+
+## How it works
+
+A dispatcher Worker accepts the request, loads or identifies the correct Dynamic Worker, and starts a Workflow instance with enough metadata to find that code again later. When the Workflow runs, the statically registered Workflow entrypoint reloads the same Dynamic Worker and forwards `run(event, step)` to it.
+
+The Workflow entrypoint stays static, but the business logic it delegates to is dynamic.
+
+```txt
+Client
+  -> Dispatcher Worker
+  -> Dynamic Worker selected or loaded
+  -> Workflow instance created with routing metadata
+  -> Static Workflow entrypoint runs
+  -> Dispatcher reloads matching Dynamic Worker
+  -> Dynamic Worker handles run(event, step)
+  -> Workflows persists step state and output
+```
+
+## Register a static Workflow entrypoint
+
+The Workflow itself is still declared statically in `wrangler.jsonc`. The dynamic part is the code that the Workflow entrypoint delegates to at runtime.
+
+The dispatcher needs:
+
+- A `worker_loaders` binding to load Dynamic Workers
+- A `workflows` binding for the statically registered Workflow class
+
+<WranglerConfig>
+
+```jsonc
+{
+	"name": "workflow-dispatcher",
+	"main": "src/index.ts",
+	"compatibility_date": "$today",
+	"worker_loaders": [
+		{
+			"binding": "LOADER",
+		},
+	],
+	"workflows": [
+		{
+			"name": "dynamic-workflow",
+			"binding": "WORKFLOW",
+			"class_name": "DynamicWorkflow",
+		},
+	],
+}
+```
+
+</WranglerConfig>
+
+## Load a Dynamic Worker from the dispatcher
+
+The dispatcher uses `env.LOADER.get(id, callback)` to load tenant-specific or run-specific code. If you reuse the same ID for the same code, Cloudflare can reuse a warm Dynamic Worker when available.
+
+Choose an ID that is stable for a given version of code, such as a `tenantId`, `runId`, or version hash.
+
+<TypeScriptExample>
+
+```ts
+function loadTenantWorker(env: Env, workerId: string, source: string) {
+	return env.LOADER.get(workerId, async () => ({
+		compatibilityDate: "$today",
+		mainModule: "index.js",
+		modules: {
+			"index.js": source,
+		},
+		globalOutbound: null,
+	}));
+}
+```
+
+</TypeScriptExample>
+
+## Start a Workflow with routing metadata
+
+The dispatcher must persist enough information to reload the same dynamic code when the Workflow later runs, retries, or resumes. In practice, that is usually a routing identifier such as `runId` or `tenantId`.
+
+Treat this metadata as routing data, not secret data. Workflow payloads are persisted.
+
+:::note[Production implementations]
+
+This example stores routing metadata directly in `params` for clarity. Production implementations often wrap the `Workflow` binding so that routing metadata is injected automatically when code calls `create()`.
+
+:::
+
+<TypeScriptExample>
+
+```ts
+export default {
+	async fetch(request: Request, env: Env) {
+		const runId = crypto.randomUUID();
+
+		const instance = await env.WORKFLOW.create({
+			id: runId,
+			params: {
+				runId,
+				payload: await request.json(),
+			},
+		});
+
+		return Response.json({
+			id: instance.id,
+			status: await instance.status(),
+		});
+	},
+};
+```
+
+</TypeScriptExample>
+
+## Delegate `run(event, step)` into the Dynamic Worker
+
+`DynamicWorkflow` is the only statically registered Workflow class. Its `run()` method reads the routing metadata, reloads the correct Dynamic Worker, and forwards the real `WorkflowStep` object into that code.
+
+This preserves normal Workflow behavior such as `step.do()`, `step.sleep()`, and `step.waitForEvent()`.
+
+<TypeScriptExample>
+
+```ts
+import {
+	WorkflowEntrypoint,
+	type WorkflowEvent,
+	type WorkflowStep,
+} from "cloudflare:workers";
+
+type Params = {
+	runId: string;
+	payload: unknown;
+};
+
+export class DynamicWorkflow extends WorkflowEntrypoint<Env, Params> {
+	async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+		const worker = loadTenantWorkerForRun(this.env, event.payload.runId);
+
+		const entrypoint = worker.getEntrypoint("TenantWorkflow") as {
+			run(event: WorkflowEvent<unknown>, step: WorkflowStep): Promise<unknown>;
+		};
+
+		return entrypoint.run(
+			{
+				...event,
+				payload: event.payload.payload,
+			},
+			step,
+		);
+	}
+}
+```
+
+</TypeScriptExample>
+
+## Write workflow logic inside the Dynamic Worker
+
+Inside the Dynamic Worker, the workflow code can look like ordinary Workflow code. The dynamic code exports a class that extends `WorkflowEntrypoint` and uses the real `step` object passed in from the dispatcher.
+
+Keep the dispatcher small and put business logic in the dynamic workflow class.
+
+<TypeScriptExample>
+
+```ts
+import { WorkflowEntrypoint } from "cloudflare:workers";
+
+export class TenantWorkflow extends WorkflowEntrypoint {
+	async run(event, step) {
+		const greeting = await step.do("compose greeting", async () => {
+			return `Hello, ${event.payload.name}!`;
+		});
+
+		await step.sleep("pause", "5 seconds");
+
+		return step.do("build response", async () => {
+			return { message: greeting };
+		});
+	}
+}
+```
+
+</TypeScriptExample>
+
+## What stays durable
+
+Workflow state lives in Workflows, not in the Dynamic Worker isolate. Step results, retries, sleeps, and final output remain durable even though the code is loaded dynamically.
+
+Dynamic Worker isolates are not guaranteed to stay warm, so the dispatcher must always be able to reload the same code from the routing metadata stored with the Workflow.
+
+## Design considerations
+
+Use this pattern carefully:
+
+- Use stable IDs for dynamic code loading
+- Keep the static Workflow entrypoint thin
+- Do not store secrets in Workflow payload metadata
+- Validate tenant identity before loading code
+- Prefer passing narrow capabilities into Dynamic Workers instead of broad access
+
+## When to use this pattern
+
+This pattern is a good fit when you need:
+
+- Per-customer Workflow logic in a shared platform
+- User-provided automation that still uses durable Workflow steps
+- Dynamic code selection without deploying a separate Worker per tenant
+
+If your workflow logic is fixed, a standard Workflow is usually simpler.
+
+## Related resources
+
+- [Workers API](/workflows/build/workers-api/)
+- [Trigger Workflows](/workflows/build/trigger-workflows/)
+- [Events and parameters](/workflows/build/events-and-parameters/)
+- [Dynamic Workers getting started](/dynamic-workers/getting-started/)
+- [Dynamic Worker Loaders](/workers/runtime-apis/bindings/worker-loader/)
+- [Bindings with Dynamic Workers](/dynamic-workers/usage/bindings/)
